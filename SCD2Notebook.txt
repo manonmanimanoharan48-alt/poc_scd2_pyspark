@@ -1,0 +1,138 @@
+# SCD Type 2 using Medallion Architecture (Bronze → Silver → Gold)
+
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.window import Window
+from delta.tables import DeltaTable
+
+# Create Spark Session
+
+spark = SparkSession.builder.appName("Fabric_SCD2_Medallion").getOrCreate()
+print("Spark session started")
+
+# Bronze Layer – Load Raw CSVs from destination lakehouse.
+bronze_path = "Tables/bronze/customers_raw"
+
+# Read raw CSVs from file folder.
+bronze_df = (
+    spark.read.option("header", True)
+    .csv("Files/bronze/*.csv")
+    .withColumn("ingest_ts", current_timestamp())
+    .withColumn("source_file", input_file_name())
+)
+
+bronze_df.write.format("delta").mode("overwrite").save(bronze_path)
+print("Bronze layer created:", bronze_path)
+
+# Silver Layer – Clean and Deduplicate
+
+silver_path = "Tables/silver/customers_cur"
+
+bronze_df = spark.read.format("delta").load(bronze_path)
+
+clean_df = (
+    bronze_df.select(
+        col("CustomerID").cast("int"),
+        col("Name").alias("Name"),
+        col("City").alias("City"),
+        col("ingest_ts"),
+        col("source_file"),
+    )
+    .dropna(subset=["CustomerID"]) #By default, dropna() removes any row that contains at least one missing value.
+)
+# Partition by the customer ID and order by the file ingest in descending order.
+window_spec = Window.partitionBy("CustomerID").orderBy(col("ingest_ts").desc())
+
+#This code block first numbers all orders for each customer_id from most recent (1) to oldest. 
+#Then, it filters for only the row with rn = 1
+deduped_df = clean_df.withColumn("rn", row_number().over(window_spec)).filter(col("rn") == 1).drop("rn")
+
+deduped_df.write.format("delta").mode("overwrite").save(silver_path)
+print("Silver layer created:", silver_path)
+
+# Gold Layer – Initial Load (if first run)
+gold_path = "Tables/gold/dim_customers_scd2"
+
+try:
+    dim_table = DeltaTable.forPath(spark, gold_path)
+    print("Gold table already exists.")
+except:
+    print("Creating new Gold layer (initial load)...")
+    silver_df = spark.read.format("delta").load(silver_path)
+    initial_gold_df = (
+        silver_df.withColumn("surrogate_key", monotonically_increasing_id())
+        .withColumn("effective_start_date", current_date())
+        .withColumn("effective_end_date",  lit(None).cast("date"))
+        .withColumn("is_current", lit(1))
+    )
+    initial_gold_df.write.format("delta").mode("overwrite").save(gold_path)
+    print("Gold layer initialized:", gold_path)
+
+# Load Silver (current data) and Gold (existing dimension)
+
+src_df = spark.read.format("delta").load(silver_path)
+dim_table = DeltaTable.forPath(spark, gold_path)
+tgt_df = dim_table.toDF().filter(col("is_current") == 1)
+
+# Detect New and Changed Records
+
+join_df = src_df.alias("src").join(tgt_df.alias("tgt"), "CustomerID", "left")
+
+# New customers
+new_customers_df = join_df.filter(col("tgt.CustomerID").isNull()).select("src.*")
+
+# Changed customers
+changed_customers_df = join_df.filter(
+    (col("tgt.CustomerID").isNotNull())
+    & (
+        (col("src.Name") != col("tgt.Name"))
+        | (col("src.City") != col("tgt.City"))
+    )
+).select("src.*", "tgt.CustomerID")
+
+# Expire Old Records
+expired_df = (
+    tgt_df.join(changed_customers_df.select("tgt.CustomerID"), "CustomerID", "inner")
+    .withColumn("effective_end_date", current_date())
+    .withColumn("is_current", lit(0))
+)
+
+# Create New Versions for Changed + New Records
+new_records_df = (
+    changed_customers_df.select("src.*")
+    .unionByName(new_customers_df, allowMissingColumns=True)
+    .withColumn("surrogate_key", monotonically_increasing_id())
+    .withColumn("effective_start_date", current_date())
+    .withColumn("effective_end_date", lit(None).cast("date"))
+    .withColumn("is_current", lit(1))
+)
+
+# Merge Expired Records into Gold.
+if expired_df.count() > 0:
+    dim_table.alias("tgt").merge(
+        expired_df.alias("src"),
+        "tgt.CustomerID = src.CustomerID AND tgt.is_current = 1",
+    ).whenMatchedUpdate(
+        set={
+            "effective_end_date": "src.effective_end_date",
+            "is_current": "src.is_current",
+        }
+    ).execute()
+    print("Expired old records updated")
+
+# Merge New + Changed Records
+
+if new_records_df.count() > 0:
+    dim_table.alias("tgt").merge(
+        new_records_df.alias("src"),
+        "tgt.CustomerID = src.CustomerID AND tgt.is_current = 1",
+    ).whenNotMatchedInsertAll().execute()
+    print("Inserted new/changed records")
+
+print("SCD Type 2 merge completed successfully!")
+
+# Validate Final Gold Table
+
+final_df = spark.read.format("delta").load(gold_path)
+final_df.orderBy("CustomerID", "effective_start_date").show(truncate=False)
+print("Validation completed.")

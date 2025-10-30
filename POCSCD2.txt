@@ -1,0 +1,14 @@
+Worked on implementing SCD type 2 with Pyspark using Microsoft notebook in Fabric.	
+
+1.Ingest CSV files into Lakehouse using copy job. 
+	-Load raw CSV files from one lakehouse to another lakehouse using copy job in pipeline.
+2. Organize data with medallion architecture.
+	Load csv files based on structure like bronze, silver and gold layers.
+	1.Bronze - load raw data and load data into table.
+	2.Silver - clean and transformation data and load cleaned data into silver table.
+	3.Gold - will implement SCD2 logic and store it into table.
+3.Created notebook to implement logic.
+	-Create Spark Session
+	-Bronze Layer – Load raw CSVs.
+	-Silver Layer – Clean and deduplicate values.
+4.Implement pipeline to automate flows with scheduled time.
